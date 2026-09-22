@@ -38,16 +38,19 @@ try {
     for (const handler of extension.handlers.get("session_start")) await handler({ reason: "startup" }, context);
     for (const handler of extension.handlers.get("session_shutdown")) await handler({ reason: "quit" }, context);
   }
-  await writeFile(join(temporary, "pane-naming.json"), JSON.stringify({ enabled: true, titleModel: "google/saved-model" }));
-  const selected = [];
+  await writeFile(join(temporary, "pane-naming.json"), JSON.stringify({ enabled: true, titleModel: "google/saved-model", cooldownSeconds: 5, checkLimit: 7 }));
+  const selected = [], notices = [];
   const context = {
     mode: "tui", sessionManager: { getSessionId: () => "offline", getEntries: () => [] },
-    ui: { notify() {} },
+    ui: { notify(message) { notices.push(message); } },
     // Stop before Herdr/model execution; verify the real factory finds the saved model without flags.
     modelRegistry: { find(provider, model) { selected.push([provider, model]); return undefined; } },
   };
   for (const handler of extension.handlers.get("session_start")) await handler({ reason: "startup" }, context);
   assert.deepEqual(selected, [["google", "saved-model"]]);
+  await extension.commands.get("pane-naming").handler("status", context);
+  assert.ok(notices.at(-1).includes("Jev checks 0/7"));
+  assert.ok(notices.at(-1).includes("Cooldown: 5s"));
   for (const handler of extension.handlers.get("session_shutdown")) await handler({ reason: "quit" }, context);
   console.log("PASS: installed Pi loads; saved defaults work without flags; fresh profiles stay off; no model tools or network.");
 } finally {
