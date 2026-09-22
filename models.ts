@@ -143,9 +143,11 @@ export async function classify(config: Config, state: NamingInput, signal: Abort
   return parseDecision(await boundedJSON(response));
 }
 
+const PR_REFERENCE = /\bPR(?:\s*#|\s+)([1-9]\d{0,9})\b/gi;
+
 export function explicitPRs(text: string): string[] {
   return [...new Set([
-    ...text.matchAll(/\bPR\s*#([1-9]\d{0,9})\b/gi),
+    ...text.matchAll(PR_REFERENCE),
     ...text.matchAll(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/([1-9]\d{0,9})(?=[\s/#?.,;:)\]>]|$)/g),
   ].map((match) => match[1]))].slice(0, 4);
 }
@@ -156,19 +158,20 @@ export function parseTitle(text: string, allowedPRs: string[]): Title {
   let result;
   try { result = JSON.parse(json); }
   catch { throw new NamingFailure("Title model returned invalid JSON."); }
-  if (typeof result?.title === "string" && Array.isArray(result.prs)) {
-    // Move redundant, explicitly selected PR references into our own prefix. Unknown references still fail below.
-    result.title = result.title.replace(/\bPR\s*#([1-9]\d{0,9})\b/gi,
-      (reference: string, pr: string) => result.prs.includes(pr) ? "" : reference).replace(/ {2,}/g, " ").trim();
-  }
-  if (!result || typeof result.title !== "string" || !result.title.trim() ||
-      result.title !== result.title.trim() || result.title.startsWith("-") || [...result.title].length > 55 ||
-      /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}#]|\bPR\s*\d/iu.test(result.title) ||
-      !Array.isArray(result.prs) || result.prs.length > 4 ||
-      result.prs.some((pr: unknown) => typeof pr !== "string" || !allowedPRs.includes(pr)) ||
-      new Set(result.prs).size !== result.prs.length) {
-    throw new NamingFailure("Title failed pane-name or PR validation.");
-  }
+  if (typeof result?.title !== "string") throw new NamingFailure("Title field was not a string.");
+  if (!Array.isArray(result.prs)) throw new NamingFailure("Title PRs field was not an array.");
+  if (result.prs.length > 4) throw new NamingFailure("Title selected more than 4 PRs.");
+  if (result.prs.some((pr: unknown) => typeof pr !== "string")) throw new NamingFailure("Title PR identifiers were not strings.");
+  if (result.prs.some((pr: string) => !allowedPRs.includes(pr))) throw new NamingFailure("Title selected a PR outside the allowed list.");
+  if (new Set(result.prs).size !== result.prs.length) throw new NamingFailure("Title selected duplicate PRs.");
+  // Move redundant, explicitly selected PR references into our own prefix. Unknown references still fail below.
+  result.title = result.title.replace(PR_REFERENCE,
+    (reference: string, pr: string) => result.prs.includes(pr) ? "" : reference).replace(/ {2,}/g, " ").trim();
+  if (!result.title) throw new NamingFailure("Title was empty after normalization.");
+  if (result.title.startsWith("-")) throw new NamingFailure("Title started with a hyphen.");
+  if ([...result.title].length > 55) throw new NamingFailure("Title exceeded 55 characters.");
+  if (/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(result.title)) throw new NamingFailure("Title contained control or invisible characters.");
+  if (/#|\bPR\s*\d/iu.test(result.title)) throw new NamingFailure("Title contained a PR reference or # sign outside the prefix.");
   return { title: result.title, prs: result.prs };
 }
 

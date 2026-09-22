@@ -199,8 +199,9 @@ this extension's actual label changes.
 
 ### PR numbers
 
-The title model may select only explicit `PR #123` references or GitHub pull-request
-URLs from the current user request, plus already-tracked PRs for a continuation.
+The title model may select only explicit `PR #123` or `PR 123` references, or GitHub
+pull-request URLs from the current user request, plus already-tracked PRs for a
+continuation.
 Assistant text and tool names cannot authorize additional PR numbers.
 Code adds the `PR #123 ·` prefix and removes redundant references to those same
 selected PRs from the model's title. Unknown PR references are rejected. A new task
@@ -260,8 +261,12 @@ in Herdr and is not suitable for sensitive content.
 An intentional `keep` or `uncertain` decision does not produce a failure warning.
 A failed attempt reports its stage (Jev, title model, or local preparation),
 elapsed time, and a safe reason: HTTP status, deadline, validation failure, or a
-known network error code where available. Probability-sum failures include the
-sum and absolute deviation from 1, computed only after all four probabilities
+known network error code where available. Title validation failures identify the
+failed rule: field types, PR count/type/allowlist/duplicates, empty or overlong
+title, leading hyphen, forbidden characters, or PR references outside the prefix.
+Rejected title text, PR values, and response bodies are not logged.
+Probability-sum failures include the sum and absolute deviation from 1, computed
+only after all four probabilities
 pass numeric/range validation. These numbers retain their JavaScript precision
 to expose rounding effects; the `0.001` tolerance is unchanged. Individual
 probabilities and raw response bodies are not retained. Unknown error details

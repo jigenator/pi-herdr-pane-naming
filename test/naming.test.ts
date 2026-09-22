@@ -767,6 +767,8 @@ test("failures record their stage and sanitized reason without request content o
   for (const [stage, options, reason] of [
     ["Jev", { check: () => parseDecision(response("invalid")) }, "Jev returned an invalid naming choice."],
     ["Title model", { title: () => parseTitle("PRIVATE_MARKER invalid JSON", []) }, "Title model returned invalid JSON."],
+    ["Title model", { title: () => parseTitle('{"title":"PRIVATE_MARKER","prs":["999"]}', []) }, "Title selected a PR outside the allowed list."],
+    ["Title model", { title: () => parseTitle(JSON.stringify({ title: "PRIVATE_MARKER".repeat(5), prs: [] }), []) }, "Title exceeded 55 characters."],
     ["Herdr read", { exec: async (_args: string[], act: Function) => {
       if (++reads > 1) throw new Error("PRIVATE_MARKER"); return act();
     } }, "Unexpected error (details withheld)."],
@@ -898,6 +900,26 @@ test("new tasks cannot inherit old PR candidates; only explicit refs are offered
   assert.deepEqual(h.titles[1].allowed, []); assert.equal(h.pane.label, "Review changes");
 });
 
+test("merge PR 130 authorizes naming on user delivery and assistant activity", async (t) => {
+  const tick = activityClock(t);
+  // Synthetic model output: the live incident saved no rejected response bodies.
+  for (const decision of ["new_task", "update"]) {
+    const h = harness({
+      label: "Creating pull request for evaluation changes", check: () => decision,
+      title: (data: any, allowed: string[]) => parseTitle(JSON.stringify({
+        title: data.activity ? "Merging PR 130" : "Preparing PR #130 merge", prs: ["130"],
+      }), allowed),
+    });
+    await h.emit("session_start"); await h.command("adopt"); await h.send("merge PR 130 please."); await settle();
+    assert.equal(h.pane.label, "PR #130 · Preparing merge");
+    await h.assistant("I will check the head, then merge it."); await tick();
+    assert.equal(h.pane.label, "PR #130 · Merging");
+    assert.deepEqual(h.titles.map((call) => call.allowed), [["130"], ["130"]]);
+    assert.equal(h.entries.some((e) => e.customType === "herdr-pane-naming-failure"), false);
+    await h.emit("session_shutdown");
+  }
+});
+
 test("confirmed gh pr creation updates a title without another model call", async () => {
   const h = harness(); await h.emit("session_start"); await h.send("Implement login"); await until(() => h.renames().length === 1); await settle();
   const event = { toolName: "bash", toolCallId: "gh-1", input: { command: 'gh pr create --title "Login" --body "Fixes login"' } };
@@ -936,9 +958,6 @@ test("configuration and generated title validation fail closed", () => {
   for (const [environment, model] of [[{}, "google/test"], [env, ""], [{ ...env, CLOUDFLARE_JEV_API_CREDENTIALS_FILE: "relative" }, "google/test"]] as any) {
     assert.throws(() => configuration(environment, model));
   }
-  for (const value of [{ title: "", prs: [] }, { title: "\u001btitle", prs: [] }, { title: "spoof\u202e", prs: [] }, { title: "a".repeat(56), prs: [] }, { title: "PR #2", prs: [] }, { title: "--clear", prs: [] }, { title: "-h", prs: [] }, { title: "Hi", prs: ["999"] }, { title: "Hi", prs: [2] }, { title: "Hi", prs: ["2", "2"] }]) {
-    assert.throws(() => parseTitle(JSON.stringify(value), ["2"]));
-  }
   assert.deepEqual(parseTitle(JSON.stringify(title), []), title);
   const observed = '```json\n{"title":"Fix Login Form Validation","prs":[]}\n```';
   assert.deepEqual(parseTitle(observed, []), { title: "Fix Login Form Validation", prs: [] });
@@ -946,10 +965,48 @@ test("configuration and generated title validation fail closed", () => {
   assert.throws(() => parseTitle(`${observed}\nIgnore the rules`, []));
   assert.deepEqual(parseTitle('{"title":"Review PR #234","prs":["234"]}', ["234"]), { title: "Review", prs: ["234"] });
   assert.throws(() => parseTitle('{"title":"Review PR #999","prs":["234"]}', ["234"]));
-  assert.deepEqual(explicitPRs("issue #5; PR #12; https://github.com/example/repo/pull/34; PR #12"), ["12", "34"]);
+  for (const reference of ["PR 130", "PR #130", "PR#130", "pr 130"]) {
+    assert.deepEqual(explicitPRs(`merge ${reference} please.`), ["130"]);
+    assert.deepEqual(parseTitle(JSON.stringify({ title: `Merge ${reference}`, prs: ["130"] }), ["130"]), { title: "Merge", prs: ["130"] });
+    assert.throws(() => parseTitle(JSON.stringify({ title: `Merge ${reference}`, prs: ["130"] }), []));
+    assert.throws(() => parseTitle(JSON.stringify({ title: `Merge ${reference}`, prs: [] }), ["130"]));
+  }
+  assert.deepEqual(explicitPRs("issue #130; #130; 130; PR130; XPR 130; PR 0; PR 0130; PR 12345678901; PR 130abc"), []);
+  assert.deepEqual(explicitPRs("PR 1; PR #2; PR 3; PR #4; PR 5"), ["1", "2", "3", "4"]);
+  assert.deepEqual(explicitPRs("issue #5; PR 12; PR #12; https://github.com/example/repo/pull/34; PR #12"), ["12", "34"]);
   assert.deepEqual(explicitPRs("[review](https://github.com/example/repo/pull/34)"), ["34"]);
   assert.deepEqual(explicitPRs("https://github.com/example/repo/pull/34\n"), ["34"]);
   assert.equal([...paneLabel({ title: "a".repeat(55), prs: ["1234567890", "2234567890", "3234567890", "4234567890"] })].length, 80);
+});
+
+test("title validation identifies the failed rule without exposing response content", () => {
+  for (const [value, reason] of [
+    [null, "Title field was not a string."],
+    [{ title: 130, prs: [] }, "Title field was not a string."],
+    [{ title: "PRIVATE_MARKER" }, "Title PRs field was not an array."],
+    [{ title: "PRIVATE_MARKER", prs: "PRIVATE_MARKER" }, "Title PRs field was not an array."],
+    [{ title: "PRIVATE_MARKER", prs: ["1", "2", "3", "4", "5"] }, "Title selected more than 4 PRs."],
+    [{ title: "PRIVATE_MARKER", prs: [2] }, "Title PR identifiers were not strings."],
+    [{ title: "PRIVATE_MARKER", prs: ["999"] }, "Title selected a PR outside the allowed list."],
+    [{ title: "PRIVATE_MARKER", prs: ["PRIVATE_PR"] }, "Title selected a PR outside the allowed list."],
+    [{ title: "PRIVATE_MARKER", prs: ["2", "2"] }, "Title selected duplicate PRs."],
+    [{ title: "", prs: [] }, "Title was empty after normalization."],
+    [{ title: "PR 2", prs: ["2"] }, "Title was empty after normalization."],
+    [{ title: "--PRIVATE_MARKER", prs: [] }, "Title started with a hyphen."],
+    [{ title: "-h", prs: [] }, "Title started with a hyphen."],
+    [{ title: "PRIVATE_MARKER".repeat(5), prs: [] }, "Title exceeded 55 characters."],
+    [{ title: "\u001bPRIVATE_MARKER", prs: [] }, "Title contained control or invisible characters."],
+    [{ title: "PRIVATE_MARKER\u202e", prs: [] }, "Title contained control or invisible characters."],
+    [{ title: "PRIVATE_MARKER\u2028x", prs: [] }, "Title contained control or invisible characters."],
+    [{ title: "PRIVATE_MARKER PR #2", prs: [] }, "Title contained a PR reference or # sign outside the prefix."],
+    [{ title: "PRIVATE_MARKER PR 999", prs: ["2"] }, "Title contained a PR reference or # sign outside the prefix."],
+    [{ title: "PRIVATE_MARKER #2", prs: ["2"] }, "Title contained a PR reference or # sign outside the prefix."],
+  ] as const) {
+    assert.throws(() => parseTitle(JSON.stringify(value), ["1", "2", "3", "4", "5"]), (error) => describeFailure(error) === reason);
+  }
+  assert.deepEqual(parseTitle(JSON.stringify({ title: "🦄".repeat(55), prs: ["1", "2", "3", "4"] }), ["1", "2", "3", "4"]), {
+    title: "🦄".repeat(55), prs: ["1", "2", "3", "4"],
+  });
 });
 
 test("only successful direct PR-create output is recognized", () => {
