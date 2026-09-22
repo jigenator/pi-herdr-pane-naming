@@ -149,6 +149,9 @@ without one, it remains off.
 - Observes ordinary interactive text inputs, then waits for the corresponding
   user `message_start`. Queued steering/follow-ups are checked when delivered,
   **not** when queued. Inputs handled elsewhere and never delivered make no call.
+  Input provenance is tracked locally even while naming is off; enabling or
+  re-enabling mid-task preserves that scope for future assistant activity, but
+  does not replay the user request or make a model call by itself.
 - Eligible user delivery starts a background check immediately. During that work,
   finalized assistant `message_end` events also trigger checks: visible progress
   text and requested tool names can reveal a shift from research to debugging,
@@ -247,8 +250,9 @@ in Herdr and is not suitable for sensitive content.
 - Cancelled/failed requests may still be billed. Counts are attempt caps, not a
   dollar budget. `/pane-naming status` reports attempts; these background calls
   are **not included in Pi's main-session token/cost totals**.
-- Counts, ownership identifiers, generated titles/PRs, and sanitized failure
-  metadata are saved as Pi custom entries (outside model context). Credentials,
+- Counts, ownership identifiers, generated titles/PRs, sanitized failure metadata,
+  and reload handoffs (request-entry reference and last-check time, not excerpts)
+  are saved as Pi custom entries (outside model context). Credentials,
   request excerpts, raw provider errors, and response bodies are not logged.
 
 ### Diagnosing failures
@@ -256,7 +260,12 @@ in Herdr and is not suitable for sensitive content.
 An intentional `keep` or `uncertain` decision does not produce a failure warning.
 A failed attempt reports its stage (Jev, title model, or local preparation),
 elapsed time, and a safe reason: HTTP status, deadline, validation failure, or a
-known network error code where available. Unknown error details stay withheld.
+known network error code where available. Probability-sum failures include the
+sum and absolute deviation from 1, computed only after all four probabilities
+pass numeric/range validation. These numbers retain their JavaScript precision
+to expose rounding effects; the `0.001` tolerance is unchanged. Individual
+probabilities and raw response bodies are not retained. Unknown error details
+stay withheld.
 The same metadata and attempt counts are saved in a `herdr-pane-naming-failure`
 custom entry, so the evidence survives reload without entering model context.
 Cancelled or superseded work is not logged as a failure. No automatic retries
@@ -269,8 +278,18 @@ This version skips images, slash/skill/template invocations, RPC/extension input
 text changed by a later input-transform hook, and assistant activity following
 those excluded inputs. Injected custom messages end the eligible activity scope.
 After the agent settles, a pending snapshot may finish unless another run starts;
-a later autonomous run needs a new eligible user delivery. Reload listens for future user deliveries;
-old conversations are not sent to a model to backfill a name.
+a later autonomous run needs a new eligible user delivery. Reload preserves an
+observed human task only while that same task is still running in the same
+session/pane/terminal. The old instance hands off the request's entry reference;
+the new instance recovers the bounded request/progress from that branch and
+preserves the cooldown. Only future assistant activity triggers a check—reload
+itself does not replay requests or retry cancelled work.
+
+Cold starts, completed tasks, and pre-upgrade instances without a handoff still
+need a new eligible user delivery. Pi's saved user messages do not record input
+origin, so this extension cannot safely infer human provenance from arbitrary
+old history. The first reload that installs this fix cannot recover scope from
+an older version; subsequent observed tasks can survive later reloads.
 
 Activity naming uses bounded progress text and tool names, not hidden reasoning or
 command contents. A silent switch between two `bash` commands may therefore be
@@ -294,8 +313,9 @@ Uses Node's test runner; no installation, credentials, live model requests, or
 live Herdr writes. Tests mock the CLI and models, including manual-name protection,
 queue delivery, assistant progress and tool-only activity, cooldown/coalescing,
 headless/child gates, stale results, failures, PR updates, privacy bounds, request
-validation, shared/reload budgets, command settings, pending-work cancellation,
-atomic-save failures, and defaults across new panes without changing other active
+validation, shared/reload budgets, mid-task enablement and reload scope,
+command settings, pending-work cancellation, atomic-save failures,
+and defaults across new panes without changing other active
 panes. Preference-file checks use isolated temporary directories, never your live settings.
 
 Optional check against an installed Pi loader, also without live calls:

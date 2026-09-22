@@ -8,6 +8,7 @@ import {
 } from "./models.ts";
 
 const STATE = "herdr-pane-naming";
+const RELOAD_SCOPE = `${STATE}-reload-scope`;
 const CLI_TIMEOUT = 1_500;
 const DEFAULT_COOLDOWN_SECONDS = 30;
 const USAGE = "Usage: /pane-naming on | off | adopt | status | cooldown <seconds: 1–3600> | limit <checks: 1–1000> | model <provider/model-id>";
@@ -122,9 +123,9 @@ export function register(pi: ExtensionAPI, dependencies: {
     try { ctx?.ui.notify(message, "info"); } catch { /* disposed session */ }
   }
   function persist() { pi.appendEntry(STATE, { ...saved }); }
-  function stop(message?: string) {
+  function stop(message?: string, preserveScope = true) {
     enabled = false;
-    cancel();
+    cancel(preserveScope);
     if (message) notify(message);
   }
   function current(version: number) { return enabled && !!ctx && version === epoch && !activeSignal?.aborted; }
@@ -135,6 +136,11 @@ export function register(pi: ExtensionAPI, dependencies: {
     const delay = Math.max(0, lastCheckAt + cooldownSeconds * 1_000 - performance.now());
     if (delay === 0) pendingActivity();
     else activityTimer = setTimeout(pendingActivity, delay).unref();
+  }
+
+  function latestInput(context: ExtensionContext) {
+    return context.sessionManager.getBranch().findLast((entry) => entry.type === "custom_message" ||
+      (entry.type === "message" && ["user", "custom"].includes(entry.message.role)));
   }
 
   async function pane(args: string[]): Promise<Pane> {
@@ -279,9 +285,9 @@ export function register(pi: ExtensionAPI, dependencies: {
     }
   }
 
-  pi.on("session_start", async (_event, context) => {
+  pi.on("session_start", async (event, context) => {
     ctx = context;
-    stop();
+    stop(undefined, false);
     submitted.clear();
     previousTask = "";
     lastCheckAt = -Infinity;
@@ -308,9 +314,44 @@ export function register(pi: ExtensionAPI, dependencies: {
       checkLimit = preferences.checkLimit ?? DEFAULT_CHECK_LIMIT;
       if (preferences.enabled || pi.getFlag("pane-naming") === true) await arm(context);
     } catch { notify("Pane naming is off: could not read the global preferences file."); }
+    if (event.reason === "reload") {
+      const entries = context.sessionManager.getBranch();
+      const checkpoint = entries.findLast((entry) => entry.type === "custom" && entry.customType === RELOAD_SCOPE);
+      // Consume the handoff even when idle; it must not authorize a later run or reload.
+      try { pi.appendEntry(RELOAD_SCOPE, {}); } catch { return; }
+      if (context.isIdle() || context.signal?.aborted) return;
+      const data = checkpoint?.type === "custom" ? checkpoint.data as {
+        sessionId?: unknown; paneId?: unknown; terminalId?: unknown; requestId?: unknown; lastCheckAt?: unknown;
+      } : undefined;
+      const latest = latestInput(context);
+      // Only the old instance can attest which delivered input was human. Never infer this from history text.
+      if (data?.sessionId === saved.sessionId && data.paneId === paneId && data.terminalId === saved.terminalId &&
+          latest?.type === "message" && latest.message.role === "user" && latest.id === data.requestId) {
+        activeRequest = text(latest.message.content)?.slice(0, 2_000);
+        activeSignal = context.signal;
+        if (typeof data.lastCheckAt === "number" && Number.isFinite(data.lastCheckAt) && data.lastCheckAt >= 0 && data.lastCheckAt <= performance.now()) {
+          lastCheckAt = data.lastCheckAt;
+        }
+        for (const entry of entries.slice(entries.findIndex((entry) => entry.id === latest.id) + 1)) {
+          if (entry.type !== "message" || entry.message.role !== "assistant" || !["stop", "toolUse"].includes(entry.message.stopReason)) continue;
+          const visible = entry.message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n").slice(-600);
+          if (visible.trim()) activityText = visible;
+        }
+      }
+    }
   });
-  pi.on("session_shutdown", async () => {
-    stop();
+  pi.on("session_shutdown", async (event, context) => {
+    if (event.reason === "reload" && eligible(env, context)) {
+      try {
+        const latest = latestInput(context);
+        const requestId = activeRequest && !activeSignal?.aborted && !context.isIdle() && latest?.type === "message" &&
+          latest.message.role === "user" && text(latest.message.content)?.slice(0, 2_000) === activeRequest ? latest.id : undefined;
+        // Persist an entry reference, not another copy of the request or assistant text.
+        pi.appendEntry(RELOAD_SCOPE, { sessionId: saved.sessionId, paneId, terminalId: saved.terminalId,
+          requestId, lastCheckAt: Number.isFinite(lastCheckAt) ? lastCheckAt : undefined });
+      } catch { /* Storage failure must not prevent cancellation/teardown. */ }
+    }
+    stop(undefined, false);
     // Never wait for a model. Let any already-issued, bounded CLI write settle before session replacement.
     await writes;
     ctx = undefined;
@@ -325,8 +366,9 @@ export function register(pi: ExtensionAPI, dependencies: {
   pi.on("agent_settled", () => { activeRequest = undefined; });
   pi.on("agent_start", () => { if (!activeRequest) cancel(); });
 
+  // Track input provenance while off too, so enabling mid-task does not require another user prompt.
   pi.on("input", (event, context) => {
-    if (!enabled || !eligible(env, context)) return;
+    if (!eligible(env, context)) return;
     const key = hash(event.text);
     const human = event.source === "interactive" && !event.images?.length && !event.text.trimStart().startsWith("/");
     // An ambiguous same-text submission from an automated source must not inherit human provenance.
@@ -334,7 +376,7 @@ export function register(pi: ExtensionAPI, dependencies: {
     if (submitted.size > 64) submitted.delete(submitted.keys().next().value!);
   });
   pi.on("message_start", (event, context) => {
-    if (!enabled || !eligible(env, context)) return;
+    if (!eligible(env, context)) return;
     if (event.message.role === "custom") { cancel(); return; }
     if (event.message.role !== "user") return;
     cancel();
@@ -352,9 +394,9 @@ export function register(pi: ExtensionAPI, dependencies: {
     });
   });
   pi.on("message_end", (event, context) => {
-    if (!enabled || !eligible(env, context) || !activeRequest || event.message.role !== "assistant") return;
+    if (!eligible(env, context) || !activeRequest || event.message.role !== "assistant") return;
     if (event.message.stopReason === "aborted" || context.signal?.aborted) { cancel(); return; }
-    if (!["stop", "toolUse"].includes(event.message.stopReason)) return;
+    if (!enabled || !["stop", "toolUse"].includes(event.message.stopReason)) return;
     // Use this event: Pi has not appended the finalized assistant message to session history yet.
     const activity = {
       text: event.message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n").slice(-600),

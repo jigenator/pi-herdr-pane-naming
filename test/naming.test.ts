@@ -48,6 +48,7 @@ function harness(options: any = {}) {
     ui: { notify: (message: string) => notices.push(message), confirm: async () => typeof options.confirm === "function" ? options.confirm() : options.confirm !== false },
     sessionManager: {
       getSessionId: () => options.sessionId ?? "session-1", getEntries: () => entries,
+      getBranch: () => [...(options.history ?? []), ...entries],
       buildContextEntries: () => options.history ?? [],
     },
     modelRegistry: { find: (provider: string, model: string) => options.missingModel ||
@@ -249,6 +250,90 @@ test("new user delivery, navigation, off, abort and injected messages discard pe
   const h = harness({ check: () => "keep" }); await h.emit("session_start"); await h.send("Research login"); await settle();
   await h.assistant("Debugging login"); await h.submit("queued task", { streamingBehavior: "followUp" });
   await tick(); assert.equal(h.checks.length, 2, "queue submission must not cancel active work");
+});
+
+test("enabling and re-enabling naming retain an observed human task without another prompt", async (t) => {
+  const tick = activityClock(t);
+  const h = harness({ on: false, title: (data: any) => ({ title: data.activity.text, prs: [] }) });
+  await h.emit("session_start"); await h.send("Fix login"); await settle();
+  assert.equal(h.checks.length, 0);
+  await h.command("on"); assert.equal(h.checks.length, 0, "enablement must not replay a request");
+  await h.assistant("Debugging login"); await tick();
+  assert.equal(h.pane.label, "Debugging login");
+  await h.command("off"); await h.assistant("Work while naming is off"); await tick();
+  assert.equal(h.checks.length, 1);
+  await h.command("on"); await h.assistant("Testing login"); await tick();
+  assert.equal(h.pane.label, "Testing login"); assert.equal(h.checks.length, 2);
+  for (const [request, extra, delivered] of [
+    ["Not human", { source: "extension" }, "Not human"], ["RPC", { source: "rpc" }, "RPC"],
+    ["/skill:test", {}, "expanded skill"], ["original", {}, "transformed"], ["image", { images: [{}] }, "image"],
+  ] as const) {
+    await h.command("off"); await h.submit(request, extra); await h.deliver(delivered);
+    await h.command("on"); await h.assistant("Do not name this"); await tick();
+    assert.equal(h.checks.length, 2, request);
+  }
+});
+
+test("reload restores only the same running human task and preserves its cooldown", async (t) => {
+  const tick = activityClock(t);
+  const history: any[] = [{ type: "message", id: "request-1", message: { role: "user", content: "PRIVATE_REQUEST" } }];
+  const h = harness({ history, check: () => "keep" });
+  h.ctx.isIdle = () => false;
+  await h.emit("session_start"); await h.send("PRIVATE_REQUEST"); await settle();
+  await h.assistant("Debugging login");
+  history.push({ type: "message", id: "progress-1", message: { role: "assistant", stopReason: "toolUse", content: [
+    { type: "text", text: "Debugging login" }, { type: "thinking", thinking: "PRIVATE_THINKING" },
+  ] } });
+  await tick(10_000);
+  await h.emit("session_shutdown", { reason: "reload" });
+  const stored = JSON.parse(JSON.stringify(h.entries));
+  assert.equal(JSON.stringify(stored).includes("PRIVATE_REQUEST"), false);
+  for (const options of [
+    {}, { idle: true }, { aborted: true }, { reason: "startup" }, { sessionId: "other-session" },
+    { env: { HERDR_PANE_ID: "other-pane" } }, { terminalId: "other-terminal" }, { label: "Manual name" },
+    { env: { PI_SUBAGENT_CHILD: "1" } }, { mode: "rpc" }, { history: [] },
+    { entries: stored.filter((e: any) => e.customType !== "herdr-pane-naming-reload-scope") },
+    { history: [...history, { type: "message", id: "request-2", message: { role: "user", content: "PRIVATE_REQUEST" } }] },
+    { history: [...history, { type: "custom_message", id: "injected", content: "Do not inherit human scope" }] },
+  ] as any[]) {
+    const resumed = harness({ history, entries: structuredClone(stored), ...options });
+    resumed.ctx.isIdle = () => options.idle === true;
+    if (options.aborted) resumed.ctx.signal = AbortSignal.abort();
+    if (options.terminalId) resumed.pane.terminal_id = options.terminalId;
+    await resumed.emit("session_start", { reason: options.reason ?? "reload" });
+    assert.equal(resumed.checks.length, 0, "reload must not replay a naming request");
+    await resumed.assistant([{ type: "toolCall", name: "bash", arguments: { command: "PRIVATE_ARGUMENT" } }], { stopReason: "toolUse" });
+    await tick(19_999);
+    const restores = Object.keys(options).length === 0;
+    assert.equal(resumed.checks.length, 0, "reload must preserve the last check's cooldown");
+    await tick(1); assert.equal(resumed.checks.length, restores ? 1 : 0);
+    if (restores) {
+      assert.equal(resumed.checks[0].data.request, "PRIVATE_REQUEST");
+      assert.deepEqual(resumed.checks[0].data.activity, { text: "Debugging login", tools: ["bash"] });
+      assert.equal(resumed.pane.label, "Fix login");
+      assert.equal(JSON.stringify(resumed.entries).includes("PRIVATE_"), false);
+    }
+    await resumed.emit("session_shutdown");
+  }
+});
+
+test("reload cannot revive ended scope and can retain an eligible task while naming is off", async (t) => {
+  const tick = activityClock(t);
+  for (const action of ["off", "agent_settled", "abort", "custom", "session_before_tree"]) {
+    const history = [{ type: "message", id: "request-1", message: { role: "user", content: "Fix login" } }];
+    const h = harness({ history, check: () => "keep" }); h.ctx.isIdle = () => false;
+    await h.emit("session_start"); await h.send("Fix login"); await settle();
+    if (action === "off") await h.command("off");
+    else if (action === "abort") await h.assistant("Aborted", { stopReason: "aborted" });
+    else if (action === "custom") await h.emit("message_start", { message: { role: "custom", content: "Injected work" } });
+    else await h.emit(action);
+    await h.emit("session_shutdown", { reason: "reload" });
+    const resumed = harness({ history, entries: structuredClone(h.entries), on: false }); resumed.ctx.isIdle = () => false;
+    await resumed.emit("session_start", { reason: "reload" });
+    await resumed.command("on"); await resumed.assistant("Debugging login"); await tick();
+    assert.equal(resumed.checks.length, action === "off" ? 1 : 0, action);
+    await resumed.emit("session_shutdown");
+  }
 });
 
 test("new assistant activity invalidates stale classification and title results", async (t) => {
@@ -701,6 +786,41 @@ test("failures record their stage and sanitized reason without request content o
   }
 });
 
+test("probability-sum failures persist numeric diagnostics without retrying or exposing raw data", async (t) => {
+  const tick = activityClock(t);
+  // Synthetic cases, not recovered responses from the live incident.
+  for (const [probabilities, reason] of [
+    [{ keep: 0.125, update: 0.125, new_task: 0.5, uncertain: 0.125 }, "Jev probabilities did not sum to 1. Sum: 0.875; absolute deviation: 0.125."],
+    [{ keep: 0.125, update: 0.25, new_task: 0.5, uncertain: 0.25 }, "Jev probabilities did not sum to 1. Sum: 1.125; absolute deviation: 0.125."],
+    [{ keep: 0, update: 0, new_task: 0.999, uncertain: 0 }, "Jev probabilities did not sum to 1. Sum: 0.999; absolute deviation: 0.0010000000000000009."],
+  ] as const) {
+    const value = response(); value.result.result.answers.naming.probabilities = probabilities;
+    const h = harness({ label: "Preserve label", check: () => parseDecision({ ...value, message: "PRIVATE_MARKER" }) });
+    await h.emit("session_start"); await h.command("adopt"); await h.send("PRIVATE_REQUEST"); await settle();
+    await tick(300_000);
+    const failures = h.entries.filter((e) => e.customType === "herdr-pane-naming-failure");
+    assert.equal(failures.length, 1); assert.equal(failures[0].data.reason, reason);
+    assert.ok(h.notices.at(-1)?.includes(reason));
+    assert.equal(h.checks.length, 1); assert.equal(h.titles.length, 0); assert.equal(h.renames().length, 0);
+    assert.equal(h.pane.label, "Preserve label");
+    assert.equal(JSON.stringify([h.entries, h.notices]).includes("PRIVATE_"), false);
+    await h.emit("session_shutdown"); await h.emit("session_start");
+    assert.equal(h.entries.find((e) => e.customType === "herdr-pane-naming-failure").data.reason, reason);
+  }
+  for (const probability of ["PRIVATE_MARKER", NaN, Infinity, -1, 1.1, null]) {
+    const value = response(); (value.result.result.answers.naming.probabilities as any).keep = probability;
+    assert.throws(() => parseDecision(value), (error) => describeFailure(error) === "Jev returned invalid probabilities.");
+  }
+  for (const probabilities of [
+    { keep: 0.25, update: 0.25, new_task: 0.5, uncertain: 0 },
+    { keep: 0, update: 0, new_task: 0.9995, uncertain: 0 },
+    { keep: 0, update: 0, new_task: 1, uncertain: 0.0005 },
+  ]) {
+    const value = response(); value.result.result.answers.naming.probabilities = probabilities;
+    assert.equal(parseDecision(value), "new_task");
+  }
+});
+
 test("deadlines identify the failing model stage; subsequent ordinary messages can recover", async (t) => {
   const deadlines: AbortController[] = [];
   t.mock.method(AbortSignal, "timeout", (ms: number) => {
@@ -929,7 +1049,7 @@ test("diagnostics retain only known error metadata and distinguish schema failur
     [(r: any) => { r.result.state = "PRIVATE_MARKER"; }, "Jev response was not Completed."],
     [(r: any) => { r.result.result.answers.naming.confidence = -1; }, "Jev returned invalid confidence."],
     [(r: any) => { r.result.result.answers.naming.probabilities.keep = "PRIVATE_MARKER"; }, "Jev returned invalid probabilities."],
-    [(r: any) => { r.result.result.answers.naming.probabilities.keep = 0.1; }, "Jev probabilities did not sum to 1."],
+    [(r: any) => { r.result.result.answers.naming.probabilities.keep = 0.1; }, "Jev probabilities did not sum to 1. Sum: 1.1; absolute deviation: 0.10000000000000009."],
     [(r: any) => { r.result.result.answers.naming.probabilities = { keep: 1, update: 0, new_task: 0, uncertain: 0 }; }, "Jev choice did not match its highest probability."],
   ] as const) {
     const value = response(); change(value);

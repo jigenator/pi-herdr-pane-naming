@@ -15,7 +15,7 @@ export type Config = { credentialsFile: string; provider: string; model: string 
 export const DEFAULT_CHECK_LIMIT = 40;
 export const DEADLINE_MS = 8_000;
 
-// Only source-controlled messages may be displayed or persisted; SDK/parser errors can contain secrets.
+// Only source-controlled messages with validated numeric metadata may be displayed or persisted; SDK/parser errors can contain secrets.
 class NamingFailure extends Error {}
 export function describeFailure(error: unknown): string {
   if (error instanceof NamingFailure) return error.message;
@@ -104,8 +104,11 @@ export function parseDecision(value: unknown): Decision {
   if (!probabilities || Object.keys(probabilities).length !== choices.length || !choices.every((choice) => probability(probabilities[choice]))) {
     throw new NamingFailure("Jev returned invalid probabilities.");
   }
-  if (Math.abs(choices.reduce((sum, choice) => sum + probabilities[choice], 0) - 1) > 0.001) {
-    throw new NamingFailure("Jev probabilities did not sum to 1.");
+  const sum = choices.reduce((total, choice) => total + probabilities[choice], 0);
+  const deviation = Math.abs(sum - 1);
+  if (deviation > 0.001) {
+    // Only validated numbers leave this parser; preserve precision for rounding diagnostics.
+    throw new NamingFailure(`Jev probabilities did not sum to 1. Sum: ${sum}; absolute deviation: ${deviation}.`);
   }
   if (choices.some((choice) => probabilities[choice] > probabilities[answer.choice])) {
     throw new NamingFailure("Jev choice did not match its highest probability.");
