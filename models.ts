@@ -106,7 +106,9 @@ export function parseDecision(value: unknown): Decision {
   }
   const sum = choices.reduce((total, choice) => total + probabilities[choice], 0);
   const deviation = Math.abs(sum - 1);
-  if (deviation > 0.001) {
+  // Compatibility allowance for four scores rounded to hundredths, not a provider precision guarantee.
+  const roundingTolerance = choices.length * 0.005;
+  if (deviation > roundingTolerance + choices.length * Number.EPSILON) {
     // Only validated numbers leave this parser; preserve precision for rounding diagnostics.
     throw new NamingFailure(`Jev probabilities did not sum to 1. Sum: ${sum}; absolute deviation: ${deviation}.`);
   }

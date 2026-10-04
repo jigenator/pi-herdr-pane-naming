@@ -788,13 +788,78 @@ test("failures record their stage and sanitized reason without request content o
   }
 });
 
+test("parseDecision accepts the reported 0.9900000000000001 sum", () => {
+  // Synthetic scores reproduce the reported sum; the incident's individual scores were not captured.
+  const value = response();
+  value.result.result.answers.naming.probabilities = { keep: 0.03, update: 0.14, new_task: 0.8, uncertain: 0.02 };
+  assert.equal(Object.values(value.result.result.answers.naming.probabilities).reduce((sum, n) => sum + n, 0), 0.9900000000000001);
+  assert.equal(parseDecision(value), "new_task");
+});
+
+test("parseDecision bounds rounding tolerance without weakening other validation", () => {
+  for (const probabilities of [
+    { keep: 0, update: 0, new_task: 0.999, uncertain: 0 },
+    { keep: 0.03, update: 0.14, new_task: 0.82, uncertain: 0.02 },
+    { keep: 0, update: 0, new_task: 0.98, uncertain: 0 },
+    { keep: 0.03, update: 0.14, new_task: 0.83, uncertain: 0.02 },
+    { keep: 0.03, update: 0.14, new_task: 0.79, uncertain: 0.02 },
+  ]) {
+    const value = response(); value.result.result.answers.naming.probabilities = probabilities;
+    const before = structuredClone(value);
+    assert.equal(parseDecision(value), "new_task");
+    assert.deepEqual(value, before, "scores must not be normalized or mutated");
+  }
+  // Just outside the bound (well beyond floating-point noise), and grossly invalid sums.
+  for (const total of [0, 0.97, 0.98 - 1e-12, 1.02 + 1e-12, 1.03, 2]) {
+    const value = response();
+    value.result.result.answers.naming.probabilities = { keep: total > 1 ? total - 1 : 0, update: 0, new_task: Math.min(total, 1), uncertain: 0 };
+    assert.throws(() => parseDecision(value), /probabilities did not sum to 1/);
+  }
+  for (const change of [
+    (a: any) => { delete a.probabilities.keep; },
+    (a: any) => { a.probabilities.extra = 0; },
+    (a: any) => { delete a.probabilities.keep; a.probabilities.extra = 0.03; },
+    (a: any) => { a.choice = "keep"; },
+    (a: any) => { a.type = "other"; },
+    ...[NaN, Infinity, -Infinity, -0.01, 1.01, "0.03", null].flatMap((n) => [
+      (a: any) => { a.probabilities.keep = n; },
+      (a: any) => { a.confidence = n; },
+    ]),
+  ]) {
+    const value = response();
+    value.result.result.answers.naming.probabilities = { keep: 0.03, update: 0.14, new_task: 0.8, uncertain: 0.02 };
+    change(value.result.result.answers.naming);
+    assert.throws(() => parseDecision(value));
+  }
+});
+
+test("rounded Jev probabilities preserve keep/rename behavior without failures or retries", async (t) => {
+  const tick = activityClock(t);
+  for (const choice of ["keep", "update", "new_task", "uncertain"]) {
+    const value = response(choice, 0.75);
+    const probabilities = { keep: 0.03, update: 0.14, new_task: 0.02, uncertain: 0.02 };
+    probabilities[choice as keyof typeof probabilities] = choice === "update" ? 0.92 : choice === "keep" ? 0.81 : 0.8;
+    value.result.result.answers.naming.probabilities = probabilities;
+    const h = harness({ label: "Preserve label", check: () => parseDecision(value) });
+    await h.emit("session_start"); await h.command("adopt"); await h.send("Fix login"); await settle();
+    await tick(300_000);
+    const rename = choice === "update" || choice === "new_task";
+    assert.equal(h.pane.label, rename ? "Fix login" : "Preserve label");
+    assert.equal(h.checks.length, 1);
+    assert.equal(h.titles.length, rename ? 1 : 0);
+    assert.equal(h.renames().length, rename ? 1 : 0);
+    assert.equal(h.entries.filter((e) => e.customType === "herdr-pane-naming-failure").length, 0);
+    assert.equal(h.notices.some((notice) => notice.includes("failed")), false);
+  }
+});
+
 test("probability-sum failures persist numeric diagnostics without retrying or exposing raw data", async (t) => {
   const tick = activityClock(t);
   // Synthetic cases, not recovered responses from the live incident.
   for (const [probabilities, reason] of [
     [{ keep: 0.125, update: 0.125, new_task: 0.5, uncertain: 0.125 }, "Jev probabilities did not sum to 1. Sum: 0.875; absolute deviation: 0.125."],
     [{ keep: 0.125, update: 0.25, new_task: 0.5, uncertain: 0.25 }, "Jev probabilities did not sum to 1. Sum: 1.125; absolute deviation: 0.125."],
-    [{ keep: 0, update: 0, new_task: 0.999, uncertain: 0 }, "Jev probabilities did not sum to 1. Sum: 0.999; absolute deviation: 0.0010000000000000009."],
+    [{ keep: 0, update: 0, new_task: 0.97, uncertain: 0 }, "Jev probabilities did not sum to 1. Sum: 0.97; absolute deviation: 0.030000000000000027."],
   ] as const) {
     const value = response(); value.result.result.answers.naming.probabilities = probabilities;
     const h = harness({ label: "Preserve label", check: () => parseDecision({ ...value, message: "PRIVATE_MARKER" }) });

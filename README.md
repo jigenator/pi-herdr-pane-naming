@@ -265,12 +265,20 @@ known network error code where available. Title validation failures identify the
 failed rule: field types, PR count/type/allowlist/duplicates, empty or overlong
 title, leading hyphen, forbidden characters, or PR references outside the prefix.
 Rejected title text, PR values, and response bodies are not logged.
-Probability-sum failures include the sum and absolute deviation from 1, computed
-only after all four probabilities
-pass numeric/range validation. These numbers retain their JavaScript precision
-to expose rounding effects; the `0.001` tolerance is unchanged. Individual
-probabilities and raw response bodies are not retained. Unknown error details
-stay withheld.
+Probability sums allow an absolute deviation from 1 of up to `0.02`
+(`4 × 0.005`, the aggregate rounding bound for four scores rounded to hundredths),
+plus `4 × Number.EPSILON` for floating-point boundary noise. This is a bounded
+compatibility allowance: [TypeSafe's choice documentation](https://docs.typesafe.ai/primitives/choice)
+says probabilities sum to 1, while the independent [Jevals methodology](https://jevals.com/methodology/)
+reports values rounded to two decimals on the wire. The reported incident's
+individual scores were not captured, so their precision remains unverified.
+Scores are not normalized; exact choice keys, finite values in
+`[0, 1]`, valid confidence, and the highest-probability choice are still required.
+Probability-sum failures outside this bound include the sum and absolute deviation
+from 1, computed only after all four probabilities pass numeric/range validation.
+These numbers retain their JavaScript precision to expose rounding effects.
+Individual probabilities and raw response bodies are not retained. Unknown error
+details stay withheld.
 The same metadata and attempt counts are saved in a `herdr-pane-naming-failure`
 custom entry, so the evidence survives reload without entering model context.
 Cancelled or superseded work is not logged as a failure. No automatic retries
