@@ -431,6 +431,12 @@ test("failures record their stage and sanitized reason, warn, and never disable 
     ["Herdr read", "Herdr CLI unavailable.", { exec: herdrFailure({ code: 0, killed: true, stderr: "", stdout: "" }) }, 0, 0],
     ["Herdr read", "Herdr returned invalid JSON.", { exec: herdrFailure({ code: 0, killed: false, stderr: "", stdout: "PRIVATE_MARKER" }) }, 0, 0],
     ["Herdr read", "Invalid Herdr response.", { exec: herdrFailure({ code: 0, killed: false, stderr: "", stdout: JSON.stringify({ error: "PRIVATE_MARKER" }) }) }, 0, 0],
+    ["Herdr read", "Invalid Herdr response.", { exec: herdrFailure({ code: 0, killed: false, stderr: "", stdout: "null" }) }, 0, 0],
+    // The read inside a rename (after Jev and the title model) is reported as a read, not a rename.
+    ["Herdr read", "Herdr CLI unavailable.", { exec: (() => {
+      let gets = 0;
+      return async (args: string[], act: Function) => args[1] === "get" && ++gets === 2 ? { code: 1, killed: false, stderr: "", stdout: "" } : act();
+    })() }, 1, 1],
     ["Herdr rename", "Herdr CLI unavailable.", { exec: renameFailure(() => ({ code: 1, killed: false, stderr: "PRIVATE_MARKER", stdout: "" })) }, 1, 1],
     ["Herdr rename", "Herdr did not confirm the rename.", { exec: renameFailure((pane) => ({
       code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { type: "pane_info", pane } }),
@@ -1119,14 +1125,15 @@ test("model commands validate, save, cancel old work and apply to this pane", as
 });
 
 test("invalid command arguments change neither preferences nor live settings", async () => {
-  const h = harness({ preferences: { enabled: true, titleModel: "google/test-model" } }); await h.emit("session_start");
+  const h = harness({ preferences: { enabled: true, titleModel: "google/test-model" }, unauthorized: ["google/new-model"] }); await h.emit("session_start");
   const original = await readFile(h.preferencesFile, "utf8");
   for (const [command, notice] of [
     ["cooldown", USAGE], ["cooldown 0", "cooldown requires a whole number from 1 to 3600."], ["cooldown 3601", "cooldown requires a whole number from 1 to 3600."],
     ["cooldown 1.5", "cooldown requires a whole number from 1 to 3600."], ["cooldown 2s", "cooldown requires a whole number from 1 to 3600."],
     ["cooldown 1e2", "cooldown requires a whole number from 1 to 3600."], ["cooldown 05", "cooldown requires a whole number from 1 to 3600."],
     ["cooldown 1 2", USAGE], ["model", USAGE], ["model no-provider", "Use /pane-naming model provider/model-id."],
-    ["model google/missing", "Title model unavailable in Pi. Choose an available provider/model-id; nothing was changed."],
+    ["model google/missing", "Title model unavailable in Pi (unknown or no credentials). Choose an available provider/model-id; nothing was changed."],
+    ["model google/new-model", "Title model unavailable in Pi (unknown or no credentials). Choose an available provider/model-id; nothing was changed."],
     ["model google/test-model extra", USAGE], ["off extra", USAGE], ["on extra", USAGE], ["status extra", USAGE], ["rename x", USAGE],
   ] as const) {
     await h.command(command);
@@ -1199,6 +1206,10 @@ test("request context is bounded and excludes thinking, tools and older history"
   const data = h.checks[0].data;
   assert.equal(data.request.length, 2000); assert.equal(data.replyContext, "a".repeat(600));
   assert.equal(data.activity, undefined); assert.equal(data.currentName, "");
+  // A hand-set label can be arbitrarily long; only the first 80 characters leave Pi.
+  const long = harness({ label: "L".repeat(300) });
+  await long.emit("session_start"); await long.deliver("Fix login"); await until(() => long.checks.length === 1);
+  assert.equal(long.checks[0].data.currentName, "L".repeat(80));
   assert.equal(JSON.stringify([h.checks, h.titles]).includes("PRIVATE_"), false);
   await settle(); await h.emit("session_start");
   await h.assistant("y".repeat(1_000)); await settle();
