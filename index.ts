@@ -25,7 +25,7 @@ function readPreferences(file: string): Preferences {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     throw new Error("Could not read pane-naming preferences.");
   }
-  if (!value || typeof value !== "object" || (value.enabled !== undefined && typeof value.enabled !== "boolean") ||
+  if (!value || typeof value !== "object" || Array.isArray(value) || (value.enabled !== undefined && typeof value.enabled !== "boolean") ||
       (value.titleModel !== undefined && (typeof value.titleModel !== "string" || !/^[^/\s]+\/\S+$/.test(value.titleModel))) ||
       (value.cooldownSeconds !== undefined && !validInteger(value.cooldownSeconds, 3_600))) {
     throw new Error("Invalid pane-naming preferences.");
@@ -261,6 +261,7 @@ export function register(pi: ExtensionAPI, dependencies: {
       preferences = {};
       notify("Pane naming could not read its saved preferences; using defaults (on). Fix or delete the preferences file to change them.", "warning");
     }
+    cooldownSeconds = preferences.cooldownSeconds ?? DEFAULT_COOLDOWN_SECONDS;
     if (preferences.enabled !== false || pi.getFlag("pane-naming") === true) enable(context);
   });
   pi.on("session_shutdown", async () => {
@@ -345,17 +346,17 @@ export function register(pi: ExtensionAPI, dependencies: {
       const value = values[0];
       if (command === "off") disable(); // Stop this pane even if saving the global default fails.
       try {
-        preferences = readPreferences(dependencies.preferencesFile);
+        // Saved defaults change only the keys a command sets; other panes' saves never leak into this runtime.
+        const saved = readPreferences(dependencies.preferencesFile);
         switch (command) {
           case "off":
-            savePreferences(dependencies.preferencesFile, { ...preferences, enabled: false });
+            savePreferences(dependencies.preferencesFile, { ...saved, enabled: false });
             preferences.enabled = false;
             notify("Pane naming off here and by default for new panes. Other running panes are unchanged. /pane-naming on turns it back on.");
             break;
           case "on": {
-            const next = { ...preferences, enabled: true };
-            savePreferences(dependencies.preferencesFile, next);
-            preferences = next;
+            savePreferences(dependencies.preferencesFile, { ...saved, enabled: true });
+            preferences.enabled = true;
             enable(context);
             notify("Pane naming on here and by default for new panes. It names the pane from the next user message or assistant activity.");
             break;
@@ -363,9 +364,8 @@ export function register(pi: ExtensionAPI, dependencies: {
           case "cooldown": {
             const number = Number(value);
             if (!/^[1-9]\d*$/.test(value) || !validInteger(number, 3_600)) { notify("cooldown requires a whole number from 1 to 3600."); break; }
-            const next = { ...preferences, cooldownSeconds: number };
-            savePreferences(dependencies.preferencesFile, next);
-            preferences = next;
+            savePreferences(dependencies.preferencesFile, { ...saved, cooldownSeconds: number });
+            preferences.cooldownSeconds = number;
             cooldownSeconds = number;
             scheduleActivity();
             notify(`Saved cooldown: ${number}s. Applied here and to future panes; other running panes are unchanged.`);
@@ -375,10 +375,8 @@ export function register(pi: ExtensionAPI, dependencies: {
             if (!/^[^/\s]+\/\S+$/.test(value)) { notify("Use /pane-naming model provider/model-id."); break; }
             const [provider, ...parts] = value.split("/");
             if (!context.modelRegistry.find(provider, parts.join("/"))) { notify("Title model unavailable in Pi. Choose an available provider/model-id; nothing was changed."); break; }
-            const next = { ...preferences, titleModel: value };
-            savePreferences(dependencies.preferencesFile, next);
+            savePreferences(dependencies.preferencesFile, { ...saved, titleModel: value });
             cancel(); // Pending old-model work must not rename after the switch.
-            preferences = next;
             modelOverride = value;
             notify(`Saved title model: ${value}. Applied here and to future panes; other running panes are unchanged.`);
             break;
@@ -389,7 +387,7 @@ export function register(pi: ExtensionAPI, dependencies: {
             const modelText = model ? `${model.provider}/${model.id}${selected && selected !== `${model.provider}/${model.id}` ? ` (fallback; ${selected} unavailable)` : !selected ? " (default)" : ""}` : "none available";
             let auth;
             try { auth = typesafeStatus().text; } catch { auth = "key status unreadable"; }
-            notify(`Pane naming ${enabled ? "on" : "off"}; new-pane default ${preferences.enabled === false ? "off" : "on"}. This session: ${counts.checks} Jev checks, ${counts.titles} title requests. Cooldown: ${cooldownSeconds}s. Title model: ${modelText}. Jev: ${auth}`);
+            notify(`Pane naming ${enabled ? "on" : "off"}; new-pane default ${saved.enabled === false ? "off" : "on"}. This session: ${counts.checks} Jev checks, ${counts.titles} title requests. Cooldown: ${cooldownSeconds}s. Title model: ${modelText}. Jev: ${auth}`);
             break;
           }
           default: notify(USAGE);
