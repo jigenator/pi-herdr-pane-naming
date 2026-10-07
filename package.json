@@ -1,13 +1,14 @@
 {
   "name": "pi-herdr-pane-naming",
-  "version": "0.1.0",
-  "description": "Event-driven Herdr pane naming for Pi, using Jev and an explicitly selected title model.",
+  "version": "0.2.0",
+  "description": "Event-driven Herdr pane naming for Pi, on by default, using Jev through pi-typesafe and a small title model.",
   "type": "module",
   "keywords": ["pi-package"],
-  "engines": { "node": ">=22.18.0" },
+  "engines": { "node": ">=22.19.0" },
   "pi": { "extensions": ["./index.ts"] },
   "files": ["index.ts", "models.ts", "README.md"],
   "scripts": { "test": "node --experimental-strip-types --test test/*.test.ts" },
+  "dependencies": { "pi-typesafe": "^0.9.1" },
   "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
   "peerDependenciesMeta": { "@earendil-works/pi-coding-agent": { "optional": true } }
 }
