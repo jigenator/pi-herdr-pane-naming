@@ -1,20 +1,20 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { authState, describeAuth } from "pi-typesafe";
 import {
-  abortable, classify, configuration, DEADLINE_MS, describeFailure, explicitPRs, generateTitle, DEFAULT_CHECK_LIMIT, paneLabel, parseTitle,
-  type Config, type NamingInput, type Title,
+  abortable, classify, DEADLINE_MS, describeFailure, explicitPRs, failure, generateTitle, paneLabel, parseLabel, resolveTitleModel,
+  type NamingInput, type Title,
 } from "./models.ts";
 
 const STATE = "herdr-pane-naming";
-const RELOAD_SCOPE = `${STATE}-reload-scope`;
 const CLI_TIMEOUT = 1_500;
 const DEFAULT_COOLDOWN_SECONDS = 30;
-const USAGE = "Usage: /pane-naming on | off | adopt | status | cooldown <seconds: 1–3600> | limit <checks: 1–1000> | model <provider/model-id>";
+const USAGE = "Usage: /pane-naming on | off | status | cooldown <seconds: 1–3600> | model <provider/model-id>";
 type Pane = { pane_id: string; terminal_id: string; label?: string };
-type Saved = { sessionId: string; paneId: string; terminalId?: string; label: string | null; title?: Title; checks: number; titles: number };
-type Preferences = { enabled: boolean; titleModel?: string; cooldownSeconds?: number; checkLimit?: number };
+// Older versions also saved checkLimit; it is accepted and ignored.
+type Preferences = { enabled?: boolean; titleModel?: string; cooldownSeconds?: number };
 const validInteger = (value: unknown, max: number): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 1 && value <= max;
 
@@ -22,16 +22,16 @@ function readPreferences(file: string): Preferences {
   let value;
   try { value = JSON.parse(readFileSync(file, "utf8")); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { enabled: false };
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     throw new Error("Could not read pane-naming preferences.");
   }
-  if (!value || typeof value.enabled !== "boolean" || (value.titleModel !== undefined &&
-      (typeof value.titleModel !== "string" || !/^[^/\s]+\/\S+$/.test(value.titleModel))) ||
-      (value.cooldownSeconds !== undefined && !validInteger(value.cooldownSeconds, 3_600)) ||
-      (value.checkLimit !== undefined && !validInteger(value.checkLimit, 1_000))) {
+  if (!value || typeof value !== "object" || (value.enabled !== undefined && typeof value.enabled !== "boolean") ||
+      (value.titleModel !== undefined && (typeof value.titleModel !== "string" || !/^[^/\s]+\/\S+$/.test(value.titleModel))) ||
+      (value.cooldownSeconds !== undefined && !validInteger(value.cooldownSeconds, 3_600))) {
     throw new Error("Invalid pane-naming preferences.");
   }
-  return value;
+  const { enabled, titleModel, cooldownSeconds } = value;
+  return { enabled, titleModel, cooldownSeconds };
 }
 
 function savePreferences(file: string, value: Preferences) {
@@ -48,12 +48,12 @@ export function eligible(env: NodeJS.ProcessEnv, ctx: Pick<ExtensionContext, "mo
   return env.HERDR_ENV === "1" && !!env.HERDR_PANE_ID && env.PI_SUBAGENT_CHILD !== "1" && ctx.mode === "tui";
 }
 
+// Text blocks only: images, thinking and tool content never leave Pi.
 function text(content: unknown): string | undefined {
   if (typeof content === "string") return content;
-  if (!Array.isArray(content) || content.some((block) => block.type !== "text")) return;
-  return content.map((block) => block.text).join("");
+  if (!Array.isArray(content)) return;
+  return content.filter((block) => block?.type === "text" && typeof block.text === "string").map((block) => block.text).join("");
 }
-const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 
 export function createdPR(command: unknown, output: string): string | undefined {
   // Deliberately not a shell parser: only a single, direct gh pr create is recognized.
@@ -65,26 +65,28 @@ export function createdPR(command: unknown, output: string): string | undefined 
 export function register(pi: ExtensionAPI, dependencies: {
   preferencesFile: string;
   env?: NodeJS.ProcessEnv;
-  classify?: typeof classify;
+  classify?: (state: NamingInput, signal: AbortSignal) => ReturnType<typeof classify>;
   generateTitle?: typeof generateTitle;
+  typesafeStatus?: () => { level: "ok" | "warning" | "error"; text: string };
 }): void {
   const env = { ...(dependencies.env ?? process.env) };
   const paneId = env.HERDR_PANE_ID ?? ""; // Never accept a target from a model, command argument, or focused pane.
-  const check = dependencies.classify ?? classify;
+  const check = dependencies.classify ?? ((state, signal) => classify(state, signal));
   const titleModel = dependencies.generateTitle ?? generateTitle;
+  const typesafeStatus = dependencies.typesafeStatus ?? (() => describeAuth(authState()));
   let ctx: ExtensionContext | undefined;
-  let config: Config | undefined;
-  let preferences: Preferences = { enabled: false };
+  let preferences: Preferences = {};
   let cooldownSeconds = DEFAULT_COOLDOWN_SECONDS;
-  let checkLimit = DEFAULT_CHECK_LIMIT;
   let modelOverride: string | undefined;
-  let saved: Saved;
   let enabled = false;
   let epoch = 0;
   let controller: AbortController | undefined;
   let writes = Promise.resolve();
+  let terminalId: string | undefined;
+  let counts = { checks: 0, titles: 0 };
+  let lastNotice: string | undefined;
   let previousTask = "";
-  let activeRequest: string | undefined;
+  let activeRequest = "";
   let activeSignal: AbortSignal | undefined;
   let lastActivity = "";
   let activityText = "";
@@ -93,40 +95,28 @@ export function register(pi: ExtensionAPI, dependencies: {
   let pendingActivity: (() => void) | undefined;
   let desired: (Title & { epoch: number }) | undefined;
   let created = new Set<string>();
-  const submitted = new Map<string, boolean>();
   const prCalls = new Map<string, number>();
 
-  pi.registerFlag("pane-naming", { description: "Enable paid pane naming for this session (otherwise use the saved default)", type: "boolean", default: false });
+  pi.registerFlag("pane-naming", { description: "Name this pane even if /pane-naming off saved the default as off", type: "boolean", default: false });
   pi.registerFlag("pane-naming-model", { description: "Title model: provider/model-id (overrides the saved model)", type: "string" });
   const selectedModel = () => modelOverride ?? (pi.getFlag("pane-naming-model") || preferences.titleModel);
 
-  function cancel(preserveScope = false) {
-    // Keep only an already-displayed title for confirmed PR-prefix updates within this user scope.
-    const displayedTitle = preserveScope && desired && paneLabel(desired) === saved.label ? desired : undefined;
+  function cancel(keepTitle = false) {
+    // Within one request, keep the latest title so a confirmed PR can still be added to it.
+    const displayed = keepTitle ? desired : undefined;
     epoch++;
     controller?.abort();
     controller = undefined;
     clearTimeout(activityTimer);
     activityTimer = undefined;
     pendingActivity = undefined;
-    if (!preserveScope) {
-      activeRequest = undefined;
-      activeSignal = undefined;
-      activityText = "";
-    }
     lastActivity = "";
-    desired = displayedTitle ? { ...displayedTitle, epoch } : undefined;
+    desired = displayed ? { ...displayed, epoch } : undefined;
     created = new Set();
     prCalls.clear();
   }
-  function notify(message: string) {
-    try { ctx?.ui.notify(message, "info"); } catch { /* disposed session */ }
-  }
-  function persist() { pi.appendEntry(STATE, { ...saved }); }
-  function stop(message?: string, preserveScope = true) {
-    enabled = false;
-    cancel(preserveScope);
-    if (message) notify(message);
+  function notify(message: string, type: "info" | "warning" = "info") {
+    try { ctx?.ui.notify(message, type); } catch { /* disposed session */ }
   }
   function current(version: number) { return enabled && !!ctx && version === epoch && !activeSignal?.aborted; }
   function scheduleActivity() {
@@ -137,20 +127,36 @@ export function register(pi: ExtensionAPI, dependencies: {
     if (delay === 0) pendingActivity();
     else activityTimer = setTimeout(pendingActivity, delay).unref();
   }
+  function fail(stage: string, error: unknown, elapsedMs: number) {
+    const reason = describeFailure(error);
+    try {
+      pi.appendEntry(`${STATE}-failure`, { paneId, ...counts, stage, reason, elapsedMs });
+    } catch { /* Diagnostics must not block work when session storage is unavailable. */ }
+    // Naming stays on; repeat the same warning only after a success, so a broken key cannot flood the screen.
+    const notice = `${stage}: ${reason}`;
+    if (notice === lastNotice) return;
+    lastNotice = notice;
+    notify(`Pane naming failed at ${stage} (${elapsedMs} ms): ${reason} Naming stays on and tries again on the next activity.`, "warning");
+  }
 
-  function latestInput(context: ExtensionContext) {
-    return context.sessionManager.getBranch().findLast((entry) => entry.type === "custom_message" ||
-      (entry.type === "message" && ["user", "custom"].includes(entry.message.role)));
+  // The latest user request on this branch anchors activity naming, including after reload, resume or tree navigation.
+  function latestRequest(context: ExtensionContext) {
+    const latest = context.sessionManager.getBranch().findLast((entry) => entry.type === "message" && entry.message.role === "user");
+    return latest?.type === "message" && latest.message.role === "user" ? text(latest.message.content)?.slice(0, 2_000) ?? "" : "";
   }
 
   async function pane(args: string[]): Promise<Pane> {
     const result = await pi.exec("herdr", ["pane", ...args], { timeout: CLI_TIMEOUT });
-    if (result.code !== 0 || result.killed || result.stdout.length > 65_536) throw new Error("Herdr unavailable.");
-    const response = JSON.parse(result.stdout);
+    if (result.code !== 0 || result.killed || result.stdout.length > 65_536) throw failure("Herdr CLI unavailable.");
+    let response;
+    try { response = JSON.parse(result.stdout); } catch { throw failure("Herdr returned invalid JSON."); }
     const value = response.result?.pane;
     if (response.error || response.result?.type !== "pane_info" || value?.pane_id !== paneId ||
         typeof value.terminal_id !== "string" || !value.terminal_id ||
-        (value.label != null && typeof value.label !== "string")) throw new Error("Invalid Herdr response.");
+        (value.label != null && typeof value.label !== "string")) throw failure("Invalid Herdr response.");
+    // HERDR_PANE_ID is inherited, so the first terminal seen is this process's. A different one is someone else's pane.
+    terminalId ??= value.terminal_id;
+    if (value.terminal_id !== terminalId) throw failure("Herdr pane now belongs to a different terminal.");
     return value;
   }
 
@@ -161,241 +167,134 @@ export function register(pi: ExtensionAPI, dependencies: {
     // Serialize writes; stale work is checked again after every asynchronous read.
     writes = writes.then(async () => {
       if (!current(version) || desired !== candidate) return;
+      const label = paneLabel(candidate);
       const before = await pane(["get", paneId]);
       if (!current(version) || desired !== candidate) return;
-      if (before.terminal_id !== saved.terminalId || (before.label ?? null) !== saved.label) {
-        stop("Pane naming paused: the pane name changed outside this extension. Use /pane-naming adopt only if you want automation to take over.");
-        return;
-      }
-      const label = paneLabel(candidate);
-      if (label !== saved.label) {
-        // Herdr 0.9 has no conditional rename. A manual rename racing this write cannot be protected atomically.
+      if (before.label !== label) {
         const after = await pane(["rename", paneId, label]);
-        if (after.terminal_id !== saved.terminalId || after.label !== label) throw new Error("Rename not confirmed.");
-        // Track even an already-issued write superseded during the CLI call; never mistake it for a user's rename.
-        saved.label = label;
+        if (after.label !== label) throw failure("Herdr did not confirm the rename.");
       }
-      saved.title = { title: candidate.title, prs: candidate.prs };
-      persist();
-    }).catch(() => {
-      // A failed write may have reached Herdr. Stop instead of blindly retrying or claiming ownership.
-      if (ctx) stop("Pane naming paused: Herdr could not confirm the update. Your work continues; no automatic retry.");
+      lastNotice = undefined;
+    }).catch((error) => {
+      if (ctx && current(version)) fail("Herdr rename", error, 0);
     });
   }
 
   async function name(request: string, version: number, context: ExtensionContext, activity?: NamingInput["activity"]) {
-    if (!config || !current(version)) return;
-    const localConfig = config;
+    if (!current(version)) return;
     controller = new AbortController();
     const signal = activeSignal ? AbortSignal.any([controller.signal, activeSignal]) : controller.signal;
     const latestAssistant = activity ? undefined : context.sessionManager.buildContextEntries().findLast((entry) =>
       entry.type === "message" && entry.message.role === "assistant");
     const replyContext = latestAssistant?.type === "message" && latestAssistant.message.role === "assistant"
       ? latestAssistant.message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n").slice(-600) : "";
-    const input: NamingInput = { request: request.slice(0, 2_000), previousTask, currentName: saved.label ?? "", replyContext, ...(activity ? { activity } : {}) };
-    let stage = "Herdr read";
+    const input: NamingInput = { request: request.slice(0, 2_000), previousTask, currentName: "", replyContext, ...(activity ? { activity } : {}) };
+    let stage = "Title model selection";
     let started = performance.now();
     try {
-      // Do not spend model tokens on a name the user has replaced while Pi was working.
+      const model = resolveTitleModel(context, selectedModel());
+      if (!model) throw failure("No title model is available. Use /pane-naming model provider/model-id.");
+      stage = "Herdr read"; started = performance.now();
       await writes;
       if (!current(version)) return;
       const before = await pane(["get", paneId]);
       if (!current(version)) return;
-      if (before.terminal_id !== saved.terminalId || (before.label ?? null) !== saved.label) {
-        stop("Pane naming paused: preserving a name set outside this extension.");
-        return;
-      }
-      if (saved.checks >= checkLimit) {
-        stop(`Pane naming paused: the ${checkLimit}-check session limit was reached. Raise /pane-naming limit, then use /pane-naming on to resume.`);
-        return;
-      }
-      input.currentName = saved.label ?? "";
-      stage = "Session state"; started = performance.now();
-      saved.checks++;
+      const shown = parseLabel(before.label);
+      input.currentName = before.label ?? "";
+      counts.checks++;
       lastCheckAt = performance.now();
-      persist();
       stage = "Jev"; started = performance.now();
       const checkSignal = AbortSignal.any([signal, AbortSignal.timeout(DEADLINE_MS)]);
-      const decision = await abortable(check(localConfig, input, checkSignal), checkSignal);
+      const decision = await abortable(check(input, checkSignal), checkSignal);
       if (!current(version)) return;
-      if (decision === "keep") {
-        if (saved.title) render(saved.title, version);
+      if (decision === "keep" || decision === "uncertain") {
+        lastNotice = undefined;
+        // Re-rendering only changes the label when a confirmed PR was created meanwhile.
+        if (decision === "keep" && shown && created.size) render(shown, version);
         return;
       }
-      if (decision === "uncertain") return;
-      const allowed = [...new Set([
-        ...(decision === "new_task" ? [] : saved.title?.prs ?? []), ...explicitPRs(request),
-      ])].slice(0, 4);
-      stage = "Session state"; started = performance.now();
-      saved.titles++;
-      persist();
+      const allowed = [...new Set([...(decision === "new_task" ? [] : shown?.prs ?? []), ...explicitPRs(request)])].slice(0, 4);
+      counts.titles++;
       stage = "Title model"; started = performance.now();
       const titleSignal = AbortSignal.any([signal, AbortSignal.timeout(DEADLINE_MS)]);
-      const title = await abortable(titleModel(localConfig, input, allowed, context, titleSignal), titleSignal);
+      const title = await abortable(titleModel(model, input, allowed, context, titleSignal), titleSignal);
       if (!current(version)) return;
       previousTask = decision === "new_task" ? input.request : previousTask || input.request;
       render(title, version);
     } catch (error) {
       if (!current(version)) return; // Superseded/cancelled work is not a failure notification.
-      const reason = describeFailure(error);
-      const elapsedMs = Math.round(performance.now() - started);
-      try {
-        pi.appendEntry(`${STATE}-failure`, {
-          sessionId: saved.sessionId, paneId, checks: saved.checks, titles: saved.titles, stage, reason, elapsedMs,
-        });
-      } catch { /* Diagnostics must not block work when session storage is unavailable. */ }
-      notify(`Pane naming failed at ${stage} (${elapsedMs} ms): ${reason} No rename from this attempt; your work continues. No automatic retry.`);
+      fail(stage, error, Math.round(performance.now() - started));
     }
   }
 
-  async function arm(context: ExtensionContext, adopt = false, remember = false) {
+  function enable(context: ExtensionContext) {
     if (!eligible(env, context)) return;
-    stop();
-    const version = epoch; // Pi creates fresh contexts per callback; lifetime is tracked by the epoch.
-    try {
-      const nextConfig = configuration(env, selectedModel());
-      if (!context.modelRegistry.find(nextConfig.provider, nextConfig.model)) throw new Error("Missing model.");
-      await writes;
-      if (!ctx || epoch !== version) return;
-      const before = await pane(["get", paneId]);
-      if (!ctx || epoch !== version) return;
-      const owned = saved.terminalId === before.terminal_id && saved.label === (before.label ?? null);
-      if (before.label && !owned && !adopt) {
-        notify("Pane naming is off: preserving the existing pane name. /pane-naming adopt explicitly lets automation replace it.");
-        return;
-      }
-      if (adopt && !(await context.ui.confirm("Let automatic naming replace this pane's name?", before.label ?? "Unnamed pane"))) return;
-      if (!ctx || epoch !== version) return;
-      if (remember) {
-        const next = { ...preferences, enabled: true, titleModel: `${nextConfig.provider}/${nextConfig.model}` };
-        savePreferences(dependencies.preferencesFile, next);
-        preferences = next;
-      }
-      config = nextConfig;
-      cooldownSeconds = preferences.cooldownSeconds ?? DEFAULT_COOLDOWN_SECONDS;
-      checkLimit = preferences.checkLimit ?? DEFAULT_CHECK_LIMIT;
-      if (!owned) saved.title = undefined;
-      saved.terminalId = before.terminal_id;
-      saved.label = before.label ?? null;
-      persist();
-      enabled = true;
-      notify(`Pane naming on: Jev → ${config.provider}/${config.model}; at most ${checkLimit} checks per session; assistant cooldown ${cooldownSeconds}s. Requests, assistant activity excerpts, and tool names leave Pi.${remember ? " Saved: new unnamed Pi panes will start enabled." : ""} Disable the old agent naming instructions before using this alongside the main agent.`);
-    } catch {
-      if (ctx && epoch === version) notify("Pane naming is off: check the global preferences file, Cloudflare settings, title model, and Herdr CLI. No model requests were made.");
-    }
+    cancel();
+    enabled = true;
+    cooldownSeconds = preferences.cooldownSeconds ?? DEFAULT_COOLDOWN_SECONDS;
+    // Stay on regardless: a later /typesafe login or model change takes effect without re-enabling.
+    if (!resolveTitleModel(context, selectedModel())) notify("Pane naming is on, but no title model is available. Use /pane-naming model provider/model-id.", "warning");
+    let auth;
+    try { auth = typesafeStatus(); } catch { auth = { level: "error", text: "Could not read the TypeSafe key status." }; }
+    if (auth.level === "error") notify(`Pane naming is on, but Jev is unavailable: ${auth.text}`, "warning");
+  }
+  function disable() {
+    enabled = false;
+    cancel();
   }
 
-  pi.on("session_start", async (event, context) => {
+  pi.on("session_start", async (_event, context) => {
     ctx = context;
-    stop(undefined, false);
-    submitted.clear();
+    disable();
     previousTask = "";
     lastCheckAt = -Infinity;
+    lastNotice = undefined;
     modelOverride = undefined;
-    cooldownSeconds = DEFAULT_COOLDOWN_SECONDS;
-    checkLimit = DEFAULT_CHECK_LIMIT;
-    saved = { sessionId: context.sessionManager.getSessionId(), paneId, label: null, checks: 0, titles: 0 };
-    for (const entry of context.sessionManager.getEntries()) {
-      if (entry.type !== "custom" || entry.customType !== STATE) continue;
-      const data = entry.data as Saved | undefined;
-      if (data?.sessionId !== saved.sessionId || data.paneId !== paneId ||
-          !Number.isSafeInteger(data.checks) || data.checks < 0 || !Number.isSafeInteger(data.titles) || data.titles < 0) continue;
-      if ((data.label !== null && (typeof data.label !== "string" || [...data.label].length > 80)) ||
-          (data.terminalId !== undefined && typeof data.terminalId !== "string")) continue;
-      try {
-        if (data.title) parseTitle(JSON.stringify(data.title), data.title.prs.filter((pr) => /^[1-9]\d{0,9}$/.test(pr)));
-        saved = { ...data };
-      } catch { /* Ignore malformed persisted ownership; never adopt its label. */ }
-    }
+    counts = { checks: 0, titles: 0 };
+    desired = undefined;
+    activeSignal = context.signal;
+    activityText = "";
     if (!eligible(env, context)) return;
-    try {
-      preferences = readPreferences(dependencies.preferencesFile);
-      cooldownSeconds = preferences.cooldownSeconds ?? DEFAULT_COOLDOWN_SECONDS;
-      checkLimit = preferences.checkLimit ?? DEFAULT_CHECK_LIMIT;
-      if (preferences.enabled || pi.getFlag("pane-naming") === true) await arm(context);
-    } catch { notify("Pane naming is off: could not read the global preferences file."); }
-    if (event.reason === "reload") {
-      const entries = context.sessionManager.getBranch();
-      const checkpoint = entries.findLast((entry) => entry.type === "custom" && entry.customType === RELOAD_SCOPE);
-      // Consume the handoff even when idle; it must not authorize a later run or reload.
-      try { pi.appendEntry(RELOAD_SCOPE, {}); } catch { return; }
-      if (context.isIdle() || context.signal?.aborted) return;
-      const data = checkpoint?.type === "custom" ? checkpoint.data as {
-        sessionId?: unknown; paneId?: unknown; terminalId?: unknown; requestId?: unknown; lastCheckAt?: unknown;
-      } : undefined;
-      const latest = latestInput(context);
-      // Only the old instance can attest which delivered input was human. Never infer this from history text.
-      if (data?.sessionId === saved.sessionId && data.paneId === paneId && data.terminalId === saved.terminalId &&
-          latest?.type === "message" && latest.message.role === "user" && latest.id === data.requestId) {
-        activeRequest = text(latest.message.content)?.slice(0, 2_000);
-        activeSignal = context.signal;
-        if (typeof data.lastCheckAt === "number" && Number.isFinite(data.lastCheckAt) && data.lastCheckAt >= 0 && data.lastCheckAt <= performance.now()) {
-          lastCheckAt = data.lastCheckAt;
-        }
-        for (const entry of entries.slice(entries.findIndex((entry) => entry.id === latest.id) + 1)) {
-          if (entry.type !== "message" || entry.message.role !== "assistant" || !["stop", "toolUse"].includes(entry.message.stopReason)) continue;
-          const visible = entry.message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n").slice(-600);
-          if (visible.trim()) activityText = visible;
-        }
-      }
+    try { activeRequest = latestRequest(context); } catch { activeRequest = ""; }
+    try { preferences = readPreferences(dependencies.preferencesFile); }
+    catch {
+      preferences = {};
+      notify("Pane naming could not read its saved preferences; using defaults (on). Fix or delete the preferences file to change them.", "warning");
     }
+    if (preferences.enabled !== false || pi.getFlag("pane-naming") === true) enable(context);
   });
-  pi.on("session_shutdown", async (event, context) => {
-    if (event.reason === "reload" && eligible(env, context)) {
-      try {
-        const latest = latestInput(context);
-        const requestId = activeRequest && !activeSignal?.aborted && !context.isIdle() && latest?.type === "message" &&
-          latest.message.role === "user" && text(latest.message.content)?.slice(0, 2_000) === activeRequest ? latest.id : undefined;
-        // Persist an entry reference, not another copy of the request or assistant text.
-        pi.appendEntry(RELOAD_SCOPE, { sessionId: saved.sessionId, paneId, terminalId: saved.terminalId,
-          requestId, lastCheckAt: Number.isFinite(lastCheckAt) ? lastCheckAt : undefined });
-      } catch { /* Storage failure must not prevent cancellation/teardown. */ }
-    }
-    stop(undefined, false);
+  pi.on("session_shutdown", async () => {
+    disable();
     // Never wait for a model. Let any already-issued, bounded CLI write settle before session replacement.
     await writes;
     ctx = undefined;
-    config = undefined;
-    submitted.clear();
   });
   pi.on("session_before_switch", () => { cancel(); });
   pi.on("session_before_fork", () => { cancel(); });
   pi.on("session_before_tree", () => { cancel(); });
-  pi.on("session_tree", () => { previousTask = ""; submitted.clear(); });
-  // Do not let a later extension-only run inherit human scope or pending naming work.
-  pi.on("agent_settled", () => { activeRequest = undefined; });
-  pi.on("agent_start", () => { if (!activeRequest) cancel(); });
-
-  // Track input provenance while off too, so enabling mid-task does not require another user prompt.
-  pi.on("input", (event, context) => {
-    if (!eligible(env, context)) return;
-    const key = hash(event.text);
-    const human = event.source === "interactive" && !event.images?.length && !event.text.trimStart().startsWith("/");
-    // An ambiguous same-text submission from an automated source must not inherit human provenance.
-    submitted.set(key, human && submitted.get(key) !== false);
-    if (submitted.size > 64) submitted.delete(submitted.keys().next().value!);
+  pi.on("session_tree", (_event, context) => {
+    previousTask = "";
+    activityText = "";
+    try { activeRequest = latestRequest(context); } catch { activeRequest = ""; }
   });
+
   pi.on("message_start", (event, context) => {
-    if (!eligible(env, context)) return;
-    if (event.message.role === "custom") { cancel(); return; }
-    if (event.message.role !== "user") return;
+    if (!eligible(env, context) || event.message.role !== "user") return;
     cancel();
-    const request = text(event.message.content);
-    if (!request) return;
-    const key = hash(request);
-    const human = submitted.get(key);
-    submitted.delete(key);
-    if (!human) return;
-    activeRequest = request.slice(0, 2_000);
+    // Every delivered user message counts: typed, queued, /goal, skill, template or extension-sent.
+    // message_start is delivery, not queue submission: a queued follow-up cannot rename an earlier task.
+    const request = text(event.message.content)?.slice(0, 2_000) ?? "";
+    activeRequest = request;
     activeSignal = context.signal;
-    // message_start is delivery, not queue submission: queued follow-ups cannot rename an earlier task.
+    activityText = "";
+    if (!request.trim()) return;
     void name(request, epoch, context).catch(() => {
       // Malformed context or a disposed Pi runtime must never block the actual request.
     });
   });
   pi.on("message_end", (event, context) => {
-    if (!eligible(env, context) || !activeRequest || event.message.role !== "assistant") return;
-    if (event.message.stopReason === "aborted" || context.signal?.aborted) { cancel(); return; }
+    if (!eligible(env, context) || event.message.role !== "assistant") return;
+    if (event.message.stopReason === "aborted" || context.signal?.aborted) { cancel(true); return; }
     if (!enabled || !["stop", "toolUse"].includes(event.message.stopReason)) return;
     // Use this event: Pi has not appended the finalized assistant message to session history yet.
     const activity = {
@@ -406,7 +305,7 @@ export function register(pi: ExtensionAPI, dependencies: {
     if (!activity.text.trim() && !activity.tools.length) return;
     // Providers may emit progress text and the following tool calls in separate messages.
     if (!activity.text.trim()) activity.text = activityText;
-    const key = hash(JSON.stringify(activity));
+    const key = JSON.stringify(activity);
     if (key === lastActivity) return;
     const request = activeRequest;
     cancel(true); // Invalidate old results now; delay only the next paid check, not cancellation.
@@ -437,63 +336,62 @@ export function register(pi: ExtensionAPI, dependencies: {
   });
 
   pi.registerCommand("pane-naming", {
-    description: "Pane naming: on | off | adopt | status | cooldown <seconds> | limit <checks> | model <provider/model-id>; settings persist",
+    description: "Pane naming: on | off | status | cooldown <seconds> | model <provider/model-id>; settings persist for new panes",
     handler: async (args, context) => {
       if (!eligible(env, context)) { context.ui.notify("Pane naming only runs in a main interactive Herdr pane.", "info"); return; }
+      ctx = context;
       const [command, ...values] = (args.trim() || "status").split(/\s+/);
-      if (values.length !== (["cooldown", "limit", "model"].includes(command) ? 1 : 0)) { notify(USAGE); return; }
+      if (values.length !== (["cooldown", "model"].includes(command) ? 1 : 0)) { notify(USAGE); return; }
       const value = values[0];
-      if (command === "off") stop(); // Stop this pane even if saving the global default fails.
+      if (command === "off") disable(); // Stop this pane even if saving the global default fails.
       try {
         preferences = readPreferences(dependencies.preferencesFile);
         switch (command) {
           case "off":
             savePreferences(dependencies.preferencesFile, { ...preferences, enabled: false });
             preferences.enabled = false;
-            notify("Pane naming off here and by default for new panes. Other running panes are unchanged.");
+            notify("Pane naming off here and by default for new panes. Other running panes are unchanged. /pane-naming on turns it back on.");
             break;
-          case "on":
-          case "adopt":
-            await arm(context, command === "adopt", true);
-            break;
-          case "cooldown":
-          case "limit": {
-            const number = Number(value);
-            const maximum = command === "cooldown" ? 3_600 : 1_000;
-            if (!/^[1-9]\d*$/.test(value) || !validInteger(number, maximum)) {
-              notify(`${command} requires a whole number from 1 to ${maximum}.`); break;
-            }
-            const key = command === "cooldown" ? "cooldownSeconds" : "checkLimit";
-            const next = { ...preferences, [key]: number };
+          case "on": {
+            const next = { ...preferences, enabled: true };
             savePreferences(dependencies.preferencesFile, next);
             preferences = next;
-            if (command === "cooldown") {
-              cooldownSeconds = number;
-              scheduleActivity();
-            } else {
-              checkLimit = number;
-              if (enabled && saved.checks >= checkLimit) stop("Pane naming paused: the new limit is already used. Attempts were not reset.");
-            }
-            notify(`Saved ${command}: ${number}${command === "cooldown" ? "s" : " checks"}. Applied here and to future panes; other running panes are unchanged.${!enabled ? " Naming remains off; use /pane-naming on to enable it." : ""}`);
+            enable(context);
+            notify("Pane naming on here and by default for new panes. It names the pane from the next user message or assistant activity.");
+            break;
+          }
+          case "cooldown": {
+            const number = Number(value);
+            if (!/^[1-9]\d*$/.test(value) || !validInteger(number, 3_600)) { notify("cooldown requires a whole number from 1 to 3600."); break; }
+            const next = { ...preferences, cooldownSeconds: number };
+            savePreferences(dependencies.preferencesFile, next);
+            preferences = next;
+            cooldownSeconds = number;
+            scheduleActivity();
+            notify(`Saved cooldown: ${number}s. Applied here and to future panes; other running panes are unchanged.`);
             break;
           }
           case "model": {
             if (!/^[^/\s]+\/\S+$/.test(value)) { notify("Use /pane-naming model provider/model-id."); break; }
             const [provider, ...parts] = value.split("/");
-            const model = parts.join("/");
-            if (!context.modelRegistry.find(provider, model)) { notify("Title model unavailable in Pi. Choose an available provider/model-id; nothing was changed."); break; }
+            if (!context.modelRegistry.find(provider, parts.join("/"))) { notify("Title model unavailable in Pi. Choose an available provider/model-id; nothing was changed."); break; }
             const next = { ...preferences, titleModel: value };
             savePreferences(dependencies.preferencesFile, next);
-            cancel(true); // Also invalidate an in-progress on/adopt that captured an older model.
+            cancel(); // Pending old-model work must not rename after the switch.
             preferences = next;
             modelOverride = value;
-            if (config) config = { ...config, provider, model };
-            notify(`Saved title model: ${value}. Applied here and to future panes; other running panes are unchanged.${!enabled ? " Naming remains off; use /pane-naming on to enable it." : " Pending old-model work was cancelled; future activity uses this model."}`);
+            notify(`Saved title model: ${value}. Applied here and to future panes; other running panes are unchanged.`);
             break;
           }
-          case "status":
-            notify(`Pane naming ${enabled ? "on" : "off"}; new-pane default ${preferences.enabled ? "on" : "off"}; Jev checks ${saved.checks}/${checkLimit}, title requests ${saved.titles}. Cooldown: ${cooldownSeconds}s. Title model: ${enabled && config ? `${config.provider}/${config.model}` : selectedModel() || "not selected"}. Saved defaults: cooldown ${preferences.cooldownSeconds ?? DEFAULT_COOLDOWN_SECONDS}s, limit ${preferences.checkLimit ?? DEFAULT_CHECK_LIMIT}, model ${preferences.titleModel || "not selected"}.`);
+          case "status": {
+            const model = resolveTitleModel(context, selectedModel());
+            const selected = selectedModel();
+            const modelText = model ? `${model.provider}/${model.id}${selected && selected !== `${model.provider}/${model.id}` ? ` (fallback; ${selected} unavailable)` : !selected ? " (default)" : ""}` : "none available";
+            let auth;
+            try { auth = typesafeStatus().text; } catch { auth = "key status unreadable"; }
+            notify(`Pane naming ${enabled ? "on" : "off"}; new-pane default ${preferences.enabled === false ? "off" : "on"}. This session: ${counts.checks} Jev checks, ${counts.titles} title requests. Cooldown: ${cooldownSeconds}s. Title model: ${modelText}. Jev: ${auth}`);
             break;
+          }
           default: notify(USAGE);
         }
       } catch {
