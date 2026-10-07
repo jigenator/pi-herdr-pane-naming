@@ -150,6 +150,7 @@ export function register(pi: ExtensionAPI, dependencies: {
     if (result.code !== 0 || result.killed || result.stdout.length > 65_536) throw failure("Herdr CLI unavailable.");
     let response;
     try { response = JSON.parse(result.stdout); } catch { throw failure("Herdr returned invalid JSON."); }
+    if (!response || typeof response !== "object") throw failure("Invalid Herdr response.");
     const value = response.result?.pane;
     if (response.error || response.result?.type !== "pane_info" || value?.pane_id !== paneId ||
         typeof value.terminal_id !== "string" || !value.terminal_id ||
@@ -164,19 +165,23 @@ export function register(pi: ExtensionAPI, dependencies: {
     if (!current(version)) return;
     const candidate = { ...title, prs: [...new Set([...title.prs, ...created])].slice(0, 4), epoch: version };
     desired = candidate;
+    let stage = "Herdr read";
+    let started = performance.now();
     // Serialize writes; stale work is checked again after every asynchronous read.
     writes = writes.then(async () => {
       if (!current(version) || desired !== candidate) return;
       const label = paneLabel(candidate);
+      started = performance.now();
       const before = await pane(["get", paneId]);
       if (!current(version) || desired !== candidate) return;
       if (before.label !== label) {
+        stage = "Herdr rename"; started = performance.now();
         const after = await pane(["rename", paneId, label]);
         if (after.label !== label) throw failure("Herdr did not confirm the rename.");
       }
       lastNotice = undefined;
     }).catch((error) => {
-      if (ctx && current(version)) fail("Herdr rename", error, 0);
+      if (ctx && current(version)) fail(stage, error, Math.round(performance.now() - started));
     });
   }
 
@@ -200,7 +205,8 @@ export function register(pi: ExtensionAPI, dependencies: {
       const before = await pane(["get", paneId]);
       if (!current(version)) return;
       const shown = parseLabel(before.label);
-      input.currentName = before.label ?? "";
+      // Hand-set labels can be long; send no more than a label this extension would write.
+      input.currentName = [...(before.label ?? "")].slice(0, 80).join("");
       counts.checks++;
       lastCheckAt = performance.now();
       stage = "Jev"; started = performance.now();
@@ -374,7 +380,8 @@ export function register(pi: ExtensionAPI, dependencies: {
           case "model": {
             if (!/^[^/\s]+\/\S+$/.test(value)) { notify("Use /pane-naming model provider/model-id."); break; }
             const [provider, ...parts] = value.split("/");
-            if (!context.modelRegistry.find(provider, parts.join("/"))) { notify("Title model unavailable in Pi. Choose an available provider/model-id; nothing was changed."); break; }
+            const found = context.modelRegistry.find(provider, parts.join("/"));
+            if (!found || context.modelRegistry.hasConfiguredAuth?.(found) === false) { notify("Title model unavailable in Pi (unknown or no credentials). Choose an available provider/model-id; nothing was changed."); break; }
             savePreferences(dependencies.preferencesFile, { ...saved, titleModel: value });
             cancel(); // Pending old-model work must not rename after the switch.
             modelOverride = value;
