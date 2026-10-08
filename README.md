@@ -120,8 +120,9 @@ is simply overwritten.
   the inherited `HERDR_PANE_ID`. The first terminal seen for that pane is
   remembered; if the pane ID later reports a different terminal, every rename from
   that process is refused (and reported) rather than touching someone else's pane.
-- Titles are validated plain text (≤55 characters, no control or invisible
-  characters, no leading hyphen, no stray PR references).
+- Titles are validated plain text (no control or invisible characters, no
+  leading hyphen, no stray PR references). Titles over 55 characters are trimmed
+  to the last whole word that fits.
 - A new delivered message, a changed assistant snapshot, navigation, shutdown,
   `off`, a model change, and agent cancellation invalidate pending model results.
   Writes are serialized and rechecked after asynchronous reads. Shutdown waits

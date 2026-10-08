@@ -449,7 +449,6 @@ test("failures record their stage and sanitized reason, warn, and never disable 
     ["Title model", "Unexpected error (details withheld).", { title: () => { throw new Error("PRIVATE_MARKER"); } }, 1, 1],
     ["Title model", "Title model returned invalid JSON.", { title: () => parseTitle("PRIVATE_MARKER invalid JSON", []) }, 1, 1],
     ["Title model", "Title selected a PR outside the allowed list.", { title: () => parseTitle('{"title":"PRIVATE_MARKER","prs":["999"]}', []) }, 1, 1],
-    ["Title model", "Title exceeded 55 characters.", { title: () => parseTitle(JSON.stringify({ title: "PRIVATE_MARKER".repeat(5), prs: [] }), []) }, 1, 1],
   ];
   for (const [stage, reason, options, checks, titles] of cases) {
     let failing = true;
@@ -1268,7 +1267,6 @@ test("title validation identifies the failed rule without exposing response cont
     [{ title: "PR 2", prs: ["2"] }, "Title was empty after normalization."],
     [{ title: "--PRIVATE_MARKER", prs: [] }, "Title started with a hyphen."],
     [{ title: "-h", prs: [] }, "Title started with a hyphen."],
-    [{ title: "PRIVATE_MARKER".repeat(5), prs: [] }, "Title exceeded 55 characters."],
     [{ title: "\u001bPRIVATE_MARKER", prs: [] }, "Title contained control or invisible characters."],
     [{ title: "PRIVATE_MARKER\u202e", prs: [] }, "Title contained control or invisible characters."],
     [{ title: "PRIVATE_MARKER\u2028x", prs: [] }, "Title contained control or invisible characters."],
@@ -1282,6 +1280,14 @@ test("title validation identifies the failed rule without exposing response cont
   assert.deepEqual(parseTitle(JSON.stringify({ title: "🦄".repeat(55), prs: ["1", "2", "3", "4"] }), ["1", "2", "3", "4"]), {
     title: "🦄".repeat(55), prs: ["1", "2", "3", "4"],
   });
+  const trimmed = (title: string) => parseTitle(JSON.stringify({ title, prs: [] }), []).title;
+  assert.equal(trimmed("Review the pane naming extension for title length overflow bugs"), "Review the pane naming extension for title length");
+  assert.equal(trimmed(`${"a".repeat(55)} tail`), "a".repeat(55));
+  assert.equal(trimmed(`${"word ".repeat(10)}and, more text`), `${"word ".repeat(10)}and`);
+  assert.equal(trimmed("x".repeat(70)), "x".repeat(55));
+  assert.equal(trimmed("🦄".repeat(70)), "🦄".repeat(55));
+  assert.throws(() => parseTitle(JSON.stringify({ title: `PR #2 ${"x".repeat(60)}`, prs: [] }), []),
+    (error) => describeFailure(error) === "Title contained a PR reference or # sign outside the prefix.");
 });
 
 test("diagnostics retain only known error metadata", () => {

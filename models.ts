@@ -107,9 +107,15 @@ export function parseTitle(text: string, allowedPRs: string[]): Title {
   // Move redundant, explicitly selected PR references into our own prefix. Unknown references still fail below.
   result.title = result.title.replace(PR_REFERENCE,
     (reference: string, pr: string) => result.prs.includes(pr) ? "" : reference).replace(/ {2,}/g, " ").trim();
+  // Models overshoot the length limit now and then; trim to the last whole word rather than fail.
+  const chars = [...result.title];
+  if (chars.length > 55) {
+    const head = chars.slice(0, 56).join("");
+    const cut = head.lastIndexOf(" ");
+    result.title = (cut > 0 ? head.slice(0, cut) : chars.slice(0, 55).join("")).replace(/[\s,.;:·–—-]+$/u, "");
+  }
   if (!result.title) throw new NamingFailure("Title was empty after normalization.");
   if (result.title.startsWith("-")) throw new NamingFailure("Title started with a hyphen.");
-  if ([...result.title].length > 55) throw new NamingFailure("Title exceeded 55 characters.");
   if (/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(result.title)) throw new NamingFailure("Title contained control or invisible characters.");
   if (/#|\bPR\s*\d/iu.test(result.title)) throw new NamingFailure("Title contained a PR reference or # sign outside the prefix.");
   return { title: result.title, prs: result.prs };
