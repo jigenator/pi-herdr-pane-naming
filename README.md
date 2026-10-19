@@ -1,5 +1,7 @@
 # pi-herdr-pane-naming
 
+> **Moved.** This extension now lives in [jigenator/industrial-os](https://github.com/jigenator/industrial-os/tree/main/pi/herdr-pane-naming) at `pi/herdr-pane-naming/`, with its full history. This repository is archived and no longer updated. Install it from there with the filtered industrial-os entry in [its README](https://github.com/jigenator/industrial-os/tree/main/pi/herdr-pane-naming#readme).
+
 A Pi extension that keeps the **actual Herdr pane label** describing what the
 session is working on, without asking the main model to do naming housekeeping.
 
